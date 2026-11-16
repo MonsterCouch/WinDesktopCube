@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -15,28 +16,38 @@ namespace WinDesktopCube;
 
 /// <summary>
 /// Runs a desktop switch:
-///  1. photograph the current desktop on each monitor
-///  2. cover each monitor with a pinned overlay showing that photo as the cube's front face
+///  1. photograph the current desktop on each monitor (often done early, see <see cref="Prewarm"/>)
+///  2. move each monitor's pinned overlay on screen, showing that photo as the cube's front face
 ///  3. switch the virtual desktop underneath (no Windows animation; the overlay hides it)
 ///  4. photograph the new desktop (the overlay is excluded from capture) and use it as the side face
-///  5. rotate the cube 90 degrees, then remove the overlay to reveal the real desktop
+///  5. rotate the cube 90 degrees, then park the overlay off-screen to reveal the real desktop
 /// </summary>
 internal sealed class CubeController
 {
+    public static bool DebugSnapshots;
+    public static bool DisablePrewarm;
+
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+
     private readonly Dispatcher _dispatcher;
     private readonly Settings _settings;
     private readonly List<CubeOverlay> _overlays = new();
-    public static bool DebugSnapshots;
+    private readonly SemaphoreSlim _captureLock = new(1, 1);
     private bool _busy;
     private int _pendingSteps;
     private int _stepCounter;
-    private double _lastFps;
+    private string _lastFrameStats = "";
+    private double _lastActivityMs;
+
+    private Task? _prewarm;
+    private double _prewarmedAtMs = double.NegativeInfinity;
+    private int _prewarmedDesktop = -1;
 
     public CubeController(Dispatcher dispatcher, Settings settings)
     {
         _dispatcher = dispatcher;
         _settings = settings;
-        SyncMonitors();
+        _dispatcher.BeginInvoke(SyncMonitors);
         SystemEvents.DisplaySettingsChanged += (_, _) => _dispatcher.BeginInvoke(SyncMonitors);
         SystemEvents.UserPreferenceChanged += (_, e) =>
         {
@@ -44,12 +55,44 @@ internal sealed class CubeController
         };
     }
 
+    private static double NowMs => Clock.Elapsed.TotalMilliseconds;
+    private bool Capturing => _busy || _prewarm is { IsCompleted: false };
+
     /// <summary>Safe to call from any thread, including the keyboard hook callback.</summary>
     public void Request(int direction) => _dispatcher.BeginInvoke(() =>
     {
         _pendingSteps += direction;
         if (!_busy) _ = RunAsync();
     });
+
+    /// <summary>
+    /// Called when Ctrl+Win goes down, typically 100-300ms before the arrow key.
+    /// That's enough time to photograph the current desktop and push a frame through
+    /// the GPU, so memory and clocks that idled down are back up before the cube
+    /// has to move. Safe to call from any thread.
+    /// </summary>
+    public void Prewarm() => _dispatcher.BeginInvoke(() =>
+    {
+        if (DisablePrewarm || Capturing || _overlays.Count == 0) return;
+        _prewarm = PrewarmAsync();
+    });
+
+    private async Task PrewarmAsync()
+    {
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            int desktop = VDA.GetCurrentDesktopNumber();
+            await GrabAsync(front: true);
+            foreach (var o in _overlays) { o.SetDirection(+1); o.SetPose(-0.01, 0); } // off-screen, but forces a real render
+            await NextFramesAsync(2);
+            foreach (var o in _overlays) o.SetPose(0, 0);
+            _prewarmedAtMs = NowMs;
+            _prewarmedDesktop = desktop;
+            Log.Write($"Prewarmed in {sw.ElapsedMilliseconds}ms");
+        }
+        catch (Exception e) { Log.Write($"Prewarm failed: {e.Message}"); }
+    }
 
     private async Task RunAsync()
     {
@@ -66,13 +109,16 @@ internal sealed class CubeController
         catch (Exception e) { Log.Write($"Switch failed: {e}"); }
         finally
         {
-            HideOverlays();
+            ParkOverlays();
             _busy = false;
+            _lastActivityMs = NowMs;
         }
     }
 
     private async Task StepAsync(int dir)
     {
+        if (_prewarm is { IsCompleted: false }) await _prewarm;
+
         int count = VDA.GetDesktopCount();
         int current = VDA.GetCurrentDesktopNumber();
         if (count <= 1 || current < 0) return;
@@ -87,13 +133,20 @@ internal sealed class CubeController
         target = (target + count) % count;
 
         var sw = Stopwatch.StartNew();
-        foreach (var o in _overlays) o.Prepare(ScreenCapture.Capture(o.Bounds), dir);
+        double idleSec = (NowMs - _lastActivityMs) / 1000;
+
+        // Reuse the Ctrl+Win prewarm photo if it's recent and of this desktop. Otherwise
+        // (no prewarm, or a chained step while the overlay is up) take a fresh one.
+        bool reused = !_overlays[0].OnScreen && current == _prewarmedDesktop && NowMs - _prewarmedAtMs < 1500;
+        _prewarmedAtMs = double.NegativeInfinity;
+        if (!reused) await GrabAsync(front: true);
+        foreach (var o in _overlays) { o.SetDirection(dir); o.SetPose(0, 0); }
         await ShowOverlaysAsync();
         long tShown = sw.ElapsedMilliseconds;
 
         if (VDA.GoToDesktopNumber(target) < 0) Log.Write($"GoToDesktopNumber({target}) failed");
         await Task.Delay(_settings.CaptureDelayMs);
-        await CaptureTargetsAsync();
+        await GrabAsync(front: false);
         long tCaptured = sw.ElapsedMilliseconds;
 
         // Explorer repaints the per-desktop wallpaper (and some apps their content) a little
@@ -101,7 +154,7 @@ internal sealed class CubeController
         int stepId = ++_stepCounter;
         _ = RefreshTargetsAsync(stepId);
 
-        double aspect = _overlays.Count > 0 ? (double)_overlays[0].Bounds.Width / _overlays[0].Bounds.Height : 16.0 / 9;
+        double aspect = (double)_overlays[0].Bounds.Width / _overlays[0].Bounds.Height;
         int snaps = 0;
         await AnimateAsync(_settings.AnimationMs, t =>
         {
@@ -115,24 +168,47 @@ internal sealed class CubeController
                 _overlays[0].SaveSnapshot(Path.Combine(Settings.Dir, $"snap_{dir:+0;-0}_{snaps}.png"));
             }
         });
-
         _stepCounter++; // stop the refresh loop
-        Log.Write($"Switched {current}->{target}: overlay up {tShown}ms, target captured {tCaptured}ms, " +
-                  $"done {sw.ElapsedMilliseconds}ms, {_lastFps:F0} fps");
+
+        Log.Write($"Switched {current}->{target} (idle {idleSec:F0}s, prewarm {(reused ? "used" : "missed")}): " +
+                  $"overlay up {tShown}ms, target captured {tCaptured}ms, done {sw.ElapsedMilliseconds}ms; {_lastFrameStats}");
 
         if (_pendingSteps == 0)
         {
-            HideOverlays();
+            ParkOverlays();
             FocusTopWindow();
         }
     }
 
-    /// <summary>Capture every monitor on a worker thread so the animation doesn't stutter.</summary>
-    private async Task CaptureTargetsAsync()
+    /// <summary>A small nudge-and-return when there is no desktop in that direction.</summary>
+    private async Task BounceAsync(int dir)
     {
-        var bounds = _overlays.Select(o => o.Bounds).ToArray();
-        var shots = await Task.Run(() => bounds.Select(ScreenCapture.Capture).ToArray());
-        for (int i = 0; i < shots.Length && i < _overlays.Count; i++) _overlays[i].SetTarget(shots[i]);
+        await GrabAsync(front: true);
+        foreach (var o in _overlays) { o.SetDirection(0); o.SetPose(0, 0); }
+        await ShowOverlaysAsync();
+        await AnimateAsync(260, t =>
+        {
+            double s = Math.Sin(Math.PI * t);
+            foreach (var o in _overlays) o.SetPose(-dir * 8 * s, 0.15 * s);
+        });
+        ParkOverlays();
+    }
+
+    /// <summary>Photograph every monitor on a worker thread, then upload into the front or side texture.</summary>
+    private async Task GrabAsync(bool front)
+    {
+        await _captureLock.WaitAsync();
+        try
+        {
+            var overlays = _overlays.ToArray();
+            await Task.Run(() => { foreach (var o in overlays) o.Capture.Grab(); });
+            foreach (var o in overlays)
+            {
+                if (front) o.LoadFrontFromCapture();
+                else o.LoadSideFromCapture();
+            }
+        }
+        finally { _captureLock.Release(); }
     }
 
     private async Task RefreshTargetsAsync(int stepId)
@@ -141,40 +217,40 @@ internal sealed class CubeController
         {
             await Task.Delay(delay);
             if (stepId != _stepCounter) return;
-            await CaptureTargetsAsync();
+            await GrabAsync(front: false);
         }
-    }
-
-    /// <summary>A small nudge-and-return when there is no desktop in that direction.</summary>
-    private async Task BounceAsync(int dir)
-    {
-        foreach (var o in _overlays) o.Prepare(ScreenCapture.Capture(o.Bounds), 0);
-        await ShowOverlaysAsync();
-        await AnimateAsync(260, t =>
-        {
-            double s = Math.Sin(Math.PI * t);
-            foreach (var o in _overlays) o.SetPose(-dir * 8 * s, 0.15 * s);
-        });
-        HideOverlays();
     }
 
     private static double EaseInOutCubic(double t) =>
         t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;
 
+    /// <summary>Drive <paramref name="apply"/> once per WPF frame and record frame-time stats.</summary>
     private Task AnimateAsync(int durationMs, Action<double> apply)
     {
         var tcs = new TaskCompletionSource();
         var clock = Stopwatch.StartNew();
-        int frames = 0;
+        int frames = 0, slow = 0;
+        double last = 0, worst = 0, firstFrame = -1;
         void OnFrame(object? s, EventArgs e)
         {
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (frames == 0) firstFrame = now;
+            else
+            {
+                double gap = now - last;
+                worst = Math.Max(worst, gap);
+                if (gap > 25) slow++;
+            }
+            last = now;
             frames++;
-            double t = Math.Min(1.0, clock.Elapsed.TotalMilliseconds / Math.Max(1, durationMs));
+
+            double t = Math.Min(1.0, now / Math.Max(1, durationMs));
             apply(t);
             if (t >= 1.0)
             {
-                _lastFps = frames / Math.Max(0.001, clock.Elapsed.TotalSeconds);
                 CompositionTarget.Rendering -= OnFrame;
+                _lastFrameStats = $"{frames / Math.Max(0.001, now / 1000):F0} fps, worst frame {worst:F0}ms, " +
+                                  $"{slow} frames >25ms, first frame after {firstFrame:F0}ms";
                 tcs.TrySetResult();
             }
         }
@@ -201,13 +277,13 @@ internal sealed class CubeController
 
     private async Task ShowOverlaysAsync()
     {
-        foreach (var o in _overlays)
-        {
-            if (!o.IsVisible) o.Show();
-            o.PlaceOnMonitor();
-        }
+        foreach (var o in _overlays) if (!o.OnScreen) o.PlaceOnMonitor();
         await NextFramesAsync(2);
-        // A window has to be shown before it can be pinned; pinning keeps it visible across the switch.
+        EnsurePinned(); // cheap; covers Explorer restarts, which forget pins
+    }
+
+    private void EnsurePinned()
+    {
         foreach (var o in _overlays)
         {
             if (VDA.IsPinnedWindow(o.Hwnd) != 1 && VDA.PinWindow(o.Hwnd) < 0)
@@ -215,24 +291,52 @@ internal sealed class CubeController
         }
     }
 
-    private void HideOverlays()
+    private void ParkOverlays()
     {
-        foreach (var o in _overlays) if (o.IsVisible) o.Hide();
+        foreach (var o in _overlays) if (o.OnScreen) o.Park();
     }
 
-    private void SyncMonitors()
+    private async void SyncMonitors()
     {
-        if (_busy) { _dispatcher.BeginInvoke(SyncMonitors, DispatcherPriority.Background); return; }
-        foreach (var o in _overlays) o.Close();
-        _overlays.Clear();
-        foreach (var screen in Screen.AllScreens)
+        if (Capturing)
         {
-            var o = new CubeOverlay(screen.Bounds, _settings);
-            new System.Windows.Interop.WindowInteropHelper(o).EnsureHandle();
-            _overlays.Add(o);
+            await Task.Delay(500);
+            SyncMonitors();
+            return;
         }
-        LoadWallpaper();
-        Log.Write($"Monitors: {string.Join(", ", _overlays.Select(o => o.Bounds.ToString()))}");
+        _busy = true; // keep switches out while we rebuild
+        try
+        {
+            foreach (var o in _overlays) o.Close();
+            _overlays.Clear();
+            foreach (var screen in Screen.AllScreens)
+            {
+                var o = new CubeOverlay(screen.Bounds, _settings);
+                o.Show(); // shown once and never hidden: it lives parked off-screen
+                o.Park();
+                _overlays.Add(o);
+            }
+            LoadWallpaper();
+            await NextFramesAsync(2);
+            EnsurePinned();
+
+            // Run one invisible rotation so every code path is JIT-compiled and the
+            // GPU resources exist before the first real switch.
+            await GrabAsync(front: true);
+            await GrabAsync(front: false);
+            foreach (var o in _overlays) o.SetDirection(+1);
+            await AnimateAsync(150, t => { foreach (var o in _overlays) o.SetPose(-90 * t, t); });
+            foreach (var o in _overlays) o.SetPose(0, 0);
+
+            Log.Write($"Monitors: {string.Join(", ", _overlays.Select(o => o.Bounds.ToString()))} (warm-up {_lastFrameStats})");
+        }
+        catch (Exception e) { Log.Write($"Monitor setup failed: {e}"); }
+        finally
+        {
+            _busy = false;
+            _lastActivityMs = NowMs;
+            if (_pendingSteps != 0) _ = RunAsync(); // a hotkey arrived during setup
+        }
     }
 
     private void LoadWallpaper()

@@ -21,18 +21,25 @@ internal static class Program
         Log.Write($"Starting. Desktops={VDA.GetDesktopCount()} current={VDA.GetCurrentDesktopNumber()}");
 
         CubeController.DebugSnapshots = Array.IndexOf(args, "--snap") >= 0;
+        CubeController.DisablePrewarm = Array.IndexOf(args, "--no-prewarm") >= 0;
         var controller = new CubeController(app.Dispatcher, settings);
         using var hook = new KeyboardHook();
         hook.SwitchRequested += controller.Request;
+        hook.Armed += controller.Prewarm;
 
         using var tray = BuildTray(app, controller, settings);
 
-        // --demo: rotate right then back left, to try the effect without hotkeys.
+        // --demo [--demo-delay N]: after N seconds (default 1), simulate Ctrl+Win, then
+        // rotate right and back left. Lets us test the effect without pressing keys.
         if (Array.IndexOf(args, "--demo") >= 0)
         {
+            int at = Array.IndexOf(args, "--demo-delay");
+            int delaySec = at >= 0 && at + 1 < args.Length && int.TryParse(args[at + 1], out int d) ? d : 1;
             app.Dispatcher.BeginInvoke(async () =>
             {
-                await System.Threading.Tasks.Task.Delay(800);
+                await System.Threading.Tasks.Task.Delay(delaySec * 1000);
+                controller.Prewarm();
+                await System.Threading.Tasks.Task.Delay(250); // typical gap before the arrow key
                 controller.Request(+1);
                 await System.Threading.Tasks.Task.Delay(2000);
                 controller.Request(-1);

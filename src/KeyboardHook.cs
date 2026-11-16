@@ -12,6 +12,11 @@ namespace WinDesktopCube;
 internal sealed class KeyboardHook : IDisposable
 {
     public event Action<int>? SwitchRequested; // -1 = left, +1 = right
+    public event Action? Armed; // Ctrl+Win pressed together; a switch may follow
+
+    private bool _armed;
+    private static bool IsCtrl(int vk) => vk is 0xA2 or 0xA3 or Win32.VK_CONTROL; // LCONTROL, RCONTROL
+    private static bool IsWin(int vk) => vk is Win32.VK_LWIN or Win32.VK_RWIN;
 
     private readonly Win32.LowLevelProc _proc; // keep delegate alive
     private IntPtr _hook;
@@ -36,6 +41,17 @@ internal sealed class KeyboardHook : IDisposable
             int msg = (int)wParam;
             bool injected = (k.flags & Win32.LLKHF_INJECTED) != 0;
             int vk = (int)k.vkCode;
+
+            // Ctrl+Win just went down: an arrow is probably coming. Let the controller warm up.
+            if (!injected && (IsCtrl(vk) || IsWin(vk)))
+            {
+                if (msg is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN)
+                {
+                    bool other = IsCtrl(vk) ? Down(Win32.VK_LWIN) || Down(Win32.VK_RWIN) : Down(Win32.VK_CONTROL);
+                    if (other && !_armed) { _armed = true; Armed?.Invoke(); }
+                }
+                else _armed = false; // either key released
+            }
 
             if (!injected && (vk == Win32.VK_LEFT || vk == Win32.VK_RIGHT))
             {

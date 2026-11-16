@@ -10,9 +10,13 @@ using Rect = System.Drawing.Rectangle;
 namespace WinDesktopCube;
 
 /// <summary>
-/// One full-screen, topmost, click-blocking window per monitor that renders the cube.
-/// The window is excluded from screen capture and pinned to all virtual desktops,
-/// so it stays visible while the desktop underneath is swapped.
+/// One full-screen, topmost window per monitor that renders the cube.
+///
+/// Its window is created once, pinned to all virtual desktops, excluded from screen
+/// capture, and never hidden. Between switches it's parked just outside the virtual
+/// screen. That keeps WPF's swap chain, the GPU textures and the render thread alive
+/// and warm. Hiding the window let Windows page those out, and the first switch after
+/// some idle time stuttered.
 ///
 /// Geometry: a face is <c>aspect</c> wide and 1 tall. The "cube" is a prism whose
 /// cross-section is aspect x aspect. The front face sits at z = +aspect/2, and the
@@ -21,24 +25,24 @@ namespace WinDesktopCube;
 /// </summary>
 internal sealed class CubeOverlay : Window
 {
-    public Rect Bounds { get; private set; }
+    public Rect Bounds { get; }
     public IntPtr Hwnd { get; private set; }
+    public MonitorCapture Capture { get; }
+    public bool OnScreen { get; private set; }
 
     private readonly PerspectiveCamera _camera = new();
     private readonly AxisAngleRotation3D _rotation = new(new Vector3D(0, 1, 0), 0);
-    private readonly ImageBrush _frontBrush = new() { Stretch = Stretch.Fill };
-    private readonly ImageBrush _sideBrush = new() { Stretch = Stretch.Fill };
+    private readonly WriteableBitmap _frontBmp, _sideBmp;
+    private readonly DiffuseMaterial _sideMaterial;
     private readonly GeometryModel3D _front, _left, _right;
-    private readonly Model3DGroup _faces = new();
     private readonly Image _background = new() { Stretch = Stretch.UniformToFill, Opacity = 0.45 };
-    private double _aspect = 16.0 / 9.0;
-    private double _baseDistance;
-    private readonly Settings _settings;
+    private readonly double _aspect;
+    private readonly double _baseDistance;
 
     public CubeOverlay(Rect bounds, Settings settings)
     {
-        _settings = settings;
         Bounds = bounds;
+        Capture = new MonitorCapture(bounds);
         WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         ShowInTaskbar = false;
@@ -48,27 +52,43 @@ internal sealed class CubeOverlay : Window
         Title = "WinDesktopCube overlay";
         Left = bounds.X; Top = bounds.Y; Width = bounds.Width; Height = bounds.Height; // corrected in SourceInitialized
 
-        RenderOptions.SetBitmapScalingMode(_frontBrush, BitmapScalingMode.HighQuality);
-        RenderOptions.SetBitmapScalingMode(_sideBrush, BitmapScalingMode.HighQuality);
+        // Textures are allocated once and overwritten in place on every switch.
+        _frontBmp = new WriteableBitmap(bounds.Width, bounds.Height, 96, 96, PixelFormats.Bgr32, null);
+        _sideBmp = new WriteableBitmap(bounds.Width, bounds.Height, 96, 96, PixelFormats.Bgr32, null);
+        var frontBrush = new ImageBrush(_frontBmp) { Stretch = Stretch.Fill };
+        var sideBrush = new ImageBrush(_sideBmp) { Stretch = Stretch.Fill };
+        RenderOptions.SetBitmapScalingMode(frontBrush, BitmapScalingMode.HighQuality);
+        RenderOptions.SetBitmapScalingMode(sideBrush, BitmapScalingMode.HighQuality);
+        _sideMaterial = new DiffuseMaterial(sideBrush);
 
-        _front = new GeometryModel3D { Material = new DiffuseMaterial(_frontBrush) };
-        _left = new GeometryModel3D { Material = new DiffuseMaterial(_sideBrush) };
-        _right = new GeometryModel3D { Material = new DiffuseMaterial(_sideBrush) };
-        _faces.Children.Add(_front);
-        _faces.Children.Add(_left);
-        _faces.Children.Add(_right);
-        _faces.Transform = new RotateTransform3D(_rotation);
+        _front = new GeometryModel3D { Material = new DiffuseMaterial(frontBrush) };
+        _left = new GeometryModel3D();
+        _right = new GeometryModel3D();
+        var faces = new Model3DGroup();
+        faces.Children.Add(_front);
+        faces.Children.Add(_left);
+        faces.Children.Add(_right);
+        faces.Transform = new RotateTransform3D(_rotation);
 
         var scene = new Model3DGroup();
         // Faces pointing at the camera get full brightness; faces turned 90 degrees away get about 60%.
         scene.Children.Add(new AmbientLight(Color.FromRgb(0x9A, 0x9A, 0x9A)));
         scene.Children.Add(new DirectionalLight(Color.FromRgb(0x65, 0x65, 0x65), new Vector3D(0, 0, -1)));
-        scene.Children.Add(_faces);
+        scene.Children.Add(faces);
+
+        _aspect = (double)bounds.Width / bounds.Height;
+        double h = _aspect / 2; // half the prism depth/width
+        _front.Geometry = Quad(new(-h, -0.5, h), new(h, -0.5, h), new(h, 0.5, h), new(-h, 0.5, h));
+        _right.Geometry = Quad(new(h, -0.5, h), new(h, -0.5, -h), new(h, 0.5, -h), new(h, 0.5, h));
+        _left.Geometry = Quad(new(-h, -0.5, -h), new(-h, -0.5, h), new(-h, 0.5, h), new(-h, 0.5, -h));
 
         _camera.LookDirection = new Vector3D(0, 0, -1);
         _camera.UpDirection = new Vector3D(0, 1, 0);
         _camera.NearPlaneDistance = 0.01;
         _camera.FarPlaneDistance = 100;
+        _camera.FieldOfView = settings.FieldOfView; // horizontal FOV in WPF
+        _baseDistance = h / Math.Tan(settings.FieldOfView * Math.PI / 360.0);
+        SetPose(0, 0);
 
         var viewport = new Viewport3D { Camera = _camera, ClipToBounds = true };
         viewport.Children.Add(new ModelVisual3D { Content = scene });
@@ -78,8 +98,8 @@ internal sealed class CubeOverlay : Window
         root.Children.Add(viewport);
         Content = root;
 
-        BuildGeometry();
         SourceInitialized += (_, _) => OnHandleCreated();
+        Closed += (_, _) => Capture.Dispose();
     }
 
     private void OnHandleCreated()
@@ -92,34 +112,25 @@ internal sealed class CubeOverlay : Window
         // Keep ourselves out of BitBlt/Graphics Capture so we can photograph the desktop underneath.
         if (!Win32.SetWindowDisplayAffinity(Hwnd, Win32.WDA_EXCLUDEFROMCAPTURE))
             Log.Write("SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE) failed");
-        PlaceOnMonitor();
+        Park();
     }
 
-    public void UpdateBounds(Rect bounds)
+    /// <summary>Move onto the monitor (same size, so WPF keeps its swap chain).</summary>
+    public void PlaceOnMonitor()
     {
-        Bounds = bounds;
-        BuildGeometry();
-        if (Hwnd != IntPtr.Zero) PlaceOnMonitor();
+        Win32.SetWindowPos(Hwnd, Win32.HWND_TOPMOST, Bounds.X, Bounds.Y, Bounds.Width, Bounds.Height, Win32.SWP_NOACTIVATE);
+        OnScreen = true;
     }
 
-    public void PlaceOnMonitor() =>
-        Win32.SetWindowPos(Hwnd, Win32.HWND_TOPMOST, Bounds.X, Bounds.Y, Bounds.Width, Bounds.Height, Win32.SWP_NOACTIVATE);
+    /// <summary>Move just past the right edge of the whole virtual screen, where no monitor can show it.</summary>
+    public void Park()
+    {
+        var vs = System.Windows.Forms.SystemInformation.VirtualScreen;
+        Win32.SetWindowPos(Hwnd, Win32.HWND_TOPMOST, vs.Right + 64, vs.Top, Bounds.Width, Bounds.Height, Win32.SWP_NOACTIVATE);
+        OnScreen = false;
+    }
 
     public void SetWallpaper(ImageSource? wallpaper) => _background.Source = wallpaper;
-
-    private void BuildGeometry()
-    {
-        _aspect = (double)Bounds.Width / Bounds.Height;
-        double h = _aspect / 2; // half the prism depth/width
-        _front.Geometry = Quad(new(-h, -0.5, h), new(h, -0.5, h), new(h, 0.5, h), new(-h, 0.5, h));
-        _right.Geometry = Quad(new(h, -0.5, h), new(h, -0.5, -h), new(h, 0.5, -h), new(h, 0.5, h));
-        _left.Geometry = Quad(new(-h, -0.5, -h), new(-h, -0.5, h), new(-h, 0.5, h), new(-h, 0.5, -h));
-
-        double fov = _settings.FieldOfView;
-        _camera.FieldOfView = fov; // horizontal FOV in WPF
-        _baseDistance = h / Math.Tan(fov * Math.PI / 360.0);
-        SetPose(0, 0);
-    }
 
     /// <summary>Quad from bottom-left, bottom-right, top-right, top-left (counter-clockwise as seen from outside).</summary>
     private static MeshGeometry3D Quad(Point3D bl, Point3D br, Point3D tr, Point3D tl)
@@ -134,17 +145,20 @@ internal sealed class CubeOverlay : Window
         return m;
     }
 
-    /// <summary>Set the current face image and choose which side gets the target desktop.</summary>
-    public void Prepare(BitmapSource current, int direction)
-    {
-        _frontBrush.ImageSource = current;
-        _sideBrush.ImageSource = current;
-        _right.Material = direction > 0 ? new DiffuseMaterial(_sideBrush) : null;
-        _left.Material = direction < 0 ? new DiffuseMaterial(_sideBrush) : null;
-        SetPose(0, 0);
-    }
+    /// <summary>Copy the latest <see cref="Capture"/> into the front face.</summary>
+    public void LoadFrontFromCapture() =>
+        _frontBmp.WritePixels(new Int32Rect(0, 0, Bounds.Width, Bounds.Height), Capture.Bits, Capture.BufferSize, Capture.Stride);
 
-    public void SetTarget(BitmapSource target) => _sideBrush.ImageSource = target;
+    /// <summary>Copy the latest <see cref="Capture"/> into the target (side) face.</summary>
+    public void LoadSideFromCapture() =>
+        _sideBmp.WritePixels(new Int32Rect(0, 0, Bounds.Width, Bounds.Height), Capture.Bits, Capture.BufferSize, Capture.Stride);
+
+    /// <summary>Show the target face on the right (+1), the left (-1), or neither (0).</summary>
+    public void SetDirection(int direction)
+    {
+        _right.Material = direction > 0 ? _sideMaterial : null;
+        _left.Material = direction < 0 ? _sideMaterial : null;
+    }
 
     /// <summary>Debug aid: render the overlay's current frame to a PNG (screenshots can't see it).</summary>
     public void SaveSnapshot(string path)
