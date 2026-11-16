@@ -22,20 +22,6 @@ Windows has no API for a custom desktop-switch animation, so we stage our own:
 6. WPF 3D turns the prism 90° while the camera pulls back and returns. Then the overlay is parked
    off-screen, and the real desktop underneath matches the last frame.
 
-### Keeping it smooth after idle
-
-The first switch after several minutes idle used to stutter (~58 fps vs ~160). Windows had paged out
-the hidden overlay's memory, and the GPU had clocked down. Three things address this:
-
-- **The overlay is never hidden.** It's shown once at startup, pinned, and parked just outside the
-  virtual screen between switches, so WPF's swap chain and GPU textures stay alive.
-- **Textures and capture buffers are allocated once** and overwritten in place, instead of ~80MB of new
-  bitmaps per switch.
-- **Warm-up on Ctrl+Win.** The hotkey hook fires as soon as Ctrl+Win are both held, usually 100–300ms
-  before the arrow. In that gap we photograph the current desktop and render a frame off-screen. The
-  switch then reuses that photo, so the overlay appears sooner, and the GPU is already awake.
-
-Each switch logs its frame stats (fps, worst frame, number of frames >25ms) to `%APPDATA%\WinDesktopCube\log.txt`.
 
 | File | Role |
 |---|---|
